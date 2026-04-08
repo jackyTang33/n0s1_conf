@@ -736,7 +736,6 @@ class SecretScanner():
         self._set_controller_config()
         if not self.regex_config or not self.controller:
             raise ValueError("No regex configuration provided to the scanner")
-            return
         scan_comment = self.scan_arguments.get("scan_comment", False)
         post_comment = self.scan_arguments.get("post_comment", False)
         limit = self.scan_arguments.get("limit", None)
