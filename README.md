@@ -1,162 +1,121 @@
-<div align="center">
-<img src="https://raw.githubusercontent.com/spark1security/n0s1/main/docs/imgs/logo.png" width="200">
+# Confluence Secret Scanner
 
-[![GitHub Release][release-img]][release]
-[![License: Apache-2.0][license-img]][license]
-![Docker Pulls][docker-pulls]
+A standalone, easy-to-read Confluence secret scanner. Scans page titles, bodies, and comments for leaked credentials using configurable regex rules.
 
-[🏠 Homepage][homepage]
-[📖 Documentation][docs]
-</div>
+## Features
 
+- **CQL scope validation** — bad queries fail fast with clear error messages (no silent fallback to full-instance scan)
+- **Pre-scan summary & approval** — see how many pages/spaces/comments will be scanned before committing
+- **Parallel regex scanning** — `ProcessPoolExecutor` for true CPU parallelism (`--workers`)
+- **Configurable regex rules** — edit `regex_patterns.yaml` to add/remove patterns
+- **JSON report output** — findings saved to a structured JSON file
 
-# n0s1 - Secret Scanner
-n0s1 ([pronunciation](https://en.wiktionary.org/wiki/nosy#Pronunciation)) is a secret scanner for Slack, Jira, Confluence, Asana, Wrike, Linear, Zendesk, GitHub and GitLab. It scans all channels/tickets/items/issues within the target platform in search of any leaked secrets in the titles, bodies, messages and comments. It is open-source and it can be easily extended to support scanning many others ticketing and messaging platforms.
+## Quick Start
 
-See [USER_MANUAL.md](https://github.com/spark1security/n0s1/blob/main/USER_MANUAL.md) to learn how to run a scan.
+### 1. Install dependencies
 
-Secrets are defined by an adaptable configuration file: [regex.yaml](https://github.com/spark1security/n0s1/blob/main/src/n0s1/config/regex.yaml) or [regex.toml](https://github.com/spark1security/n0s1/blob/main/src/n0s1/config/regex.toml). The scanner loads the configuration and searches for sensitive information, which includes:
-* Github Personal Access Tokens
-* GitLab Personal Access Tokens
-* AWS Access Tokens
-* PKCS8 private keys
-* RSA private keys
-* SSH private keys
-* npm access tokens
-
-### Currently supported target platforms:
-* Local filesystem
-* [Slack](https://slack.com)
-* [Jira](https://www.atlassian.com/software/jira)
-* [Confluence](https://www.atlassian.com/software/confluence)
-* [Asana](https://asana.com)
-* [Wrike](https://www.wrike.com)
-* [Linear](https://linear.app/)
-* [Zendesk](https://www.zendesk.com/)
-* [GitHub](https://github.com/)
-* [GitLab](https://gitlab.com/)
-
-### Install
 ```bash
-python3 -m ensurepip --upgrade
-python3 -m pip install --upgrade n0s1
-n0s1 --help
+pip install -r requirements.txt
 ```
 
-### Quick Start
-[CLI:](https://pypi.org/project/n0s1/)
+### 2. Configure credentials
+
+Copy `.env.example` to `.env` and fill in your Confluence details:
+
 ```bash
-python3 -m pip install n0s1
-n0s1 jira_scan --server "https://<YOUR_JIRA_SERVER>.atlassian.net" --api-key "<YOUR_JIRA_API_TOKEN>"
+cp .env.example .env
 ```
 
-[Docker:](https://hub.docker.com/r/spark1security/n0s1)
+```env
+CONFLUENCE_SERVER=https://yourcompany.atlassian.net
+CONFLUENCE_EMAIL=you@example.com
+CONFLUENCE_TOKEN=your-api-token-here
+```
+
+Or pass them via CLI flags (see below).
+
+### 3. Run
+
 ```bash
-docker run spark1security/n0s1 jira_scan --server "https://<YOUR_JIRA_SERVER>.atlassian.net" --api-key "<YOUR_JIRA_API_TOKEN>"
+# Scan everything (with interactive approval prompt):
+python -m confluence_scanner.main
+
+# Scan a specific space with CQL, auto-approve:
+python -m confluence_scanner.main --scope "cql:space=SEC AND type=page" --yes
+
+# Use 4 parallel workers:
+python -m confluence_scanner.main --scope "cql:space=DEV" --yes --workers 4
+
+# Skip comment scanning:
+python -m confluence_scanner.main --skip-comments --yes
 ```
 
-[From source:](https://github.com/spark1security/n0s1#quick-start)
-```bash
-git clone https://github.com/spark1security/n0s1.git
-cd n0s1/src/n0s1
-python3 -m venv n0s1_python
-source n0s1_python/bin/activate
-python3 -m pip install -r ../../requirements.txt
-python3 n0s1.py jira_scan --server "https://<YOUR_JIRA_SERVER>.atlassian.net" --api-key "<YOUR_JIRA_API_TOKEN>"
-deactivate
+## CLI Reference
+
+| Flag | Description | Default |
+|------|-------------|---------|
+| `--server` | Confluence base URL | env `CONFLUENCE_SERVER` |
+| `--email` | User email | env `CONFLUENCE_EMAIL` |
+| `--api-key` | API token | env `CONFLUENCE_TOKEN` |
+| `--scope` | CQL scope query (e.g. `"cql:space=SEC AND type=page"`) | None (all spaces) |
+| `--regex-file` | Path to YAML regex rules | `regex_patterns.yaml` |
+| `--report-file` | Output JSON report path | `confluence_report.json` |
+| `-y`, `--yes` | Auto-approve scan summary (for CI/automation) | Off |
+| `--workers` | Parallel workers: a number, or `auto` for `min(cpu_count, 8)` | `1` |
+| `--skip-comments` | Don't scan page comments | Off |
+| `--show-secrets` | Show raw matched secrets in logs (CAUTION!) | Off |
+| `--post-comment` | Post warning comments on pages with leaks | Off |
+| `--timeout` | HTTP request timeout (seconds) | None |
+| `--limit` | Max pages per HTTP request | None |
+| `--insecure` | Skip SSL verification | Off |
+| `--debug` | Verbose debug logging | Off |
+
+## Project Structure
+
+```
+confluence_scanner/
+├── __init__.py              # Package marker
+├── main.py                  # CLI entry-point & orchestration
+├── confluence_controller.py # Confluence API client (connect, CQL, fetch pages)
+├── scanner.py               # Regex engine, two-pass scan, parallel dispatch
+├── regex_patterns.yaml      # Editable regex rules (YAML)
+└── tests/
+    ├── __init__.py
+    └── test_scanner.py      # Unit tests
 ```
 
-[Python SDK - See SDK_GUIDE.md:](https://github.com/spark1security/n0s1/blob/main/SDK_GUIDE.md)
-```bash
-python3 -m pip install n0s1
-```
-```python
-try:
-    import scanner
-except:
-    import n0s1.scanner as scanner
+**No inheritance chains, no factory pattern, no platform abstraction.**
+Each file is self-contained and does one thing.
 
-# Create scanner instance
-scanner_instance = scanner.SecretScanner(
-    target="jira_scan",
-    server="https://yourcompany.atlassian.net",
-    email="your-email@company.com",
-    api_key="your-jira-api-token",
-    debug=True
-)
+## Regex Rules
 
-# Run the scan
-result = scanner_instance.scan()
+Edit `confluence_scanner/regex_patterns.yaml` to customise detection rules:
 
-# Process results
-print(f"Scan complete. Found {len(result.get('findings', {}))} potential secrets")
-```
-
-
-[GitHub Actions:](https://github.com/marketplace/actions/spark-1-n0s1)
 ```yaml
-jobs:
-  jira_secret_scanning:
-    steps:
-      - uses: spark1security/n0s1-action@main
-        env:
-          JIRA_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
-        with:
-          scan-target: 'jira_scan'
-          user-email: 'service_account@<YOUR_COMPANY>.atlassian.net'
-          platform-url: 'https://<YOUR_COMPANY>.atlassian.net'
+rules:
+  - id: my_custom_rule
+    description: My Custom API Key
+    regex: '\bMYKEY_[a-zA-Z0-9]{32}\b'
+    tags: [custom]
+    keywords: [MYKEY_]
 ```
 
-GitLab CI - Add the following job to your .gitlab-ci.yml file:
-```yaml
-jira-scan:
-  stage: test
-  image:
-    name: spark1security/n0s1
-    entrypoint: [""]
-  script:
-    - n0s1 jira_scan --email "service_account@<YOUR_COMPANY>.atlassian.net" --api-key $JIRA_TOKEN --server "https://<YOUR_COMPANY>.atlassian.net" --report-file gl-dast-report.json --report-format gitlab
-    - apt-get update
-    - apt-get -y install jq
-    - cat gl-dast-report.json | jq
-  artifacts:
-    reports:
-      dast:
-        - gl-dast-report.json
+## Parallelisation Guide
+
+| Scan size | Recommended `--workers` |
+|-----------|------------------------|
+| < 1,000 pages | `1` (default — fast enough) |
+| 1,000–10,000 pages | `4` |
+| > 10,000 pages | `auto` or your CPU core count |
+
+Workers use `ProcessPoolExecutor` (not threads) for true CPU parallelism around Python's GIL.
+
+## Running Tests
+
+```bash
+python -m pytest confluence_scanner/tests/ -v
 ```
 
+## License
 
-## AI Agents
-
-| Resource | Description |
-|---|---|
-| [`tool-schema.json`](tool-schema.json) | Tool-use / function-calling schema (Anthropic & OpenAI compatible). Load this to give an AI agent the ability to invoke n0s1 as structured tool calls. |
-| [`docs/ai.md`](docs/ai.md) | AI-optimized reference covering all interfaces: CLI, Docker, Python SDK, and GitHub Actions. |
-
-## Want more? Check out Spark 1
-
-If you liked n0s1, you will love Spark 1 which builds on top of n0s1 to provide even more enhanced capabilities for a complete security management offering.
-
-Don't forget to check out the <https://spark1.us> website for more information about our products and services.
-
-If you'd like to contact Spark 1 or request a demo, please use the [free consultation form](https://spark1.us/contact-us-1).
-
-## Community
-
-n0s1 is a [Spark 1](https://spark1.us) open source project.  
-Learn about our open source work and portfolio [here](https://spark1.us/n0s1).  
-Contact us about any matter by opening a GitHub Discussion [here](https://github.com/spark1security/n0s1/issues)
-
-
-
-[docker-pulls]: https://img.shields.io/docker/pulls/spark1security/n0s1?logo=docker&label=docker%20pulls%20%2F%20n0s1
-[release]: https://github.com/spark1security/n0s1/releases
-[release-img]: https://img.shields.io/github/v/release/spark1security/n0s1.svg?logo=github
-[github-downloads-img]: https://img.shields.io/github/downloads/spark1security/n0s1/total?logo=github
-[license]: https://github.com/spark1security/n0s1/blob/main/LICENSE
-[license-img]: https://img.shields.io/badge/license-GPLv3-blue
-[homepage]: https://spark1.us/n0s1
-[docs]: https://spark1.us/n0s1doc
-
-
-
+See [LICENSE](LICENSE).

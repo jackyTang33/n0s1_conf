@@ -1,0 +1,127 @@
+title: confluence_scanner regex rules
+rules:
+  - id: gitlab_personal_access_token
+    description: GitLab Personal Access Token
+    regex: '\bglpat-[0-9a-zA-Z_\-]{20}\b'
+    tags: [gitlab]
+    keywords: [glpat]
+
+  - id: gitlab_pipeline_trigger_token
+    description: GitLab Pipeline Trigger Token
+    regex: '\bglptt-[0-9a-zA-Z_\-]{20}\b'
+    tags: [gitlab]
+    keywords: [glptt]
+
+  - id: aws_access_key
+    description: AWS Access Key ID
+    regex: '\b(A3T[A-Z0-9]|AKIA|AGPA|AIDA|AROA|AIPA|ANPA|ANVA|ASIA)[A-Z0-9]{16}\b'
+    tags: [aws]
+    keywords: [AKIA, AGPA, AIDA, AROA, AIPA, ANPA, ANVA, ASIA, A3T]
+
+  - id: aws_secret_key
+    description: AWS Secret Access Key
+    regex: '(?i)aws(.{0,20})?[''\"\\s][0-9a-zA-Z/+]{40}[''\"\\s]'
+    tags: [aws]
+    keywords: [aws]
+
+  - id: github_pat
+    description: GitHub Personal Access Token
+    regex: '\bghp_[A-Za-z0-9]{36}\b'
+    tags: [github]
+    keywords: [ghp_]
+
+  - id: github_fine_grained_pat
+    description: GitHub Fine-Grained Personal Access Token
+    regex: '\bgithub_pat_[a-zA-Z0-9]{22}_[a-zA-Z0-9]{59}\b'
+    tags: [github]
+    keywords: [github_pat_]
+
+  - id: github_oauth
+    description: GitHub OAuth Access Token
+    regex: '\bgho_[A-Za-z0-9]{36}\b'
+    tags: [github]
+    keywords: [gho_]
+
+  - id: slack_bot_token
+    description: Slack Bot Token
+    regex: '\bxoxb-[0-9]{10,13}\-[0-9]{10,13}[a-zA-Z0-9-]*\b'
+    tags: [slack]
+    keywords: [xoxb]
+
+  - id: slack_user_token
+    description: Slack User Token
+    regex: '\bxoxp-[0-9]{10,13}\-[0-9]{10,13}[a-zA-Z0-9-]*\b'
+    tags: [slack]
+    keywords: [xoxp]
+
+  - id: slack_webhook
+    description: Slack Incoming Webhook URL
+    regex: 'https://hooks\.slack\.com/services/T[a-zA-Z0-9_]{8}/B[a-zA-Z0-9_]{8}/[a-zA-Z0-9_]{24}'
+    tags: [slack]
+    keywords: [hooks.slack.com]
+
+  - id: generic_api_key
+    description: Generic API Key
+    regex: '(?i)(api[_-]?key|apikey|api[_-]?token)\s*[:=]\s*[''\"]{0,1}[0-9a-zA-Z]{32,}[''\"]{0,1}'
+    tags: [generic]
+    keywords: [api_key, apikey, api_token, api-key]
+
+  - id: generic_secret
+    description: Generic Secret
+    regex: '(?i)(secret|password|passwd|pwd)\s*[:=]\s*[''\"]{0,1}[^\s''\",]{8,}[''\"]{0,1}'
+    tags: [generic]
+    keywords: [secret, password, passwd, pwd]
+
+  - id: private_key
+    description: Private Key
+    regex: '-----BEGIN (RSA |EC |DSA |OPENSSH )?PRIVATE KEY-----'
+    tags: [crypto]
+    keywords: [PRIVATE KEY]
+
+  - id: jwt_token
+    description: JSON Web Token
+    regex: '\beyJ[A-Za-z0-9-_]+\.eyJ[A-Za-z0-9-_]+\.[A-Za-z0-9-_.+/=]*\b'
+    tags: [jwt]
+    keywords: [eyJ]
+
+  - id: google_api_key
+    description: Google API Key
+    regex: '\bAIza[0-9A-Za-z_-]{35}\b'
+    tags: [google]
+    keywords: [AIza]
+
+  - id: heroku_api_key
+    description: Heroku API Key
+    regex: '(?i)heroku(.{0,20})?[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}'
+    tags: [heroku]
+    keywords: [heroku]
+
+  - id: mailgun_api_key
+    description: Mailgun API Key
+    regex: '\bkey-[0-9a-zA-Z]{32}\b'
+    tags: [mailgun]
+    keywords: [key-]
+
+  - id: twilio_api_key
+    description: Twilio API Key
+    regex: '\bSK[0-9a-fA-F]{32}\b'
+    tags: [twilio]
+    keywords: [SK]
+
+  - id: stripe_secret_key
+    description: Stripe Secret Key
+    regex: '\b(sk_live|sk_test)_[0-9a-zA-Z]{24,}\b'
+    tags: [stripe]
+    keywords: [sk_live, sk_test]
+
+  - id: square_access_token
+    description: Square Access Token
+    regex: '\bsq0atp-[0-9A-Za-z\-_]{22}\b'
+    tags: [square]
+    keywords: [sq0atp]
+
+  - id: sendgrid_api_key
+    description: SendGrid API Key
+    regex: '\bSG\.[0-9A-Za-z\-_]{22}\.[0-9A-Za-z\-_]{43}\b'
+    tags: [sendgrid]
+    keywords: [SG.]
