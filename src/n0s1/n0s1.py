@@ -151,6 +151,20 @@ def init_argparse() -> argparse.ArgumentParser:
         type=str,
         help="Define a search query Ex: \"search:org:spark1security action in:name\" for GitHub or \"jql:project != IT\" for Jira. If using with --map-file, it defines a chunk of the map file to be scanned. Ex: 3/4 (will scan the third quarter of the map)."
     )
+    parent_parser.add_argument(
+        "-y", "--yes",
+        dest="auto_approve",
+        action="store_true",
+        help="Auto-approve scan scope summary without interactive prompt (for CI/automation)."
+    )
+    parent_parser.add_argument(
+        "--workers",
+        dest="workers",
+        nargs="?",
+        default="1",
+        type=str,
+        help="Number of parallel worker processes for regex scanning. Use 'auto' for min(cpu_count, 8). Default: 1 (sequential)."
+    )
     subparsers = parser.add_subparsers(
         help="Subcommands", dest="command", metavar="COMMAND"
     )
@@ -501,14 +515,28 @@ def main():
             scanner.log_message(f"Scan scope saved to map file: {map_file_path}")
         return True
 
+    # Parse --workers flag
+    auto_approve = getattr(args, "auto_approve", False)
+    workers_str = getattr(args, "workers", "1") or "1"
+    if workers_str.lower() == "auto":
+        import multiprocessing
+        num_workers = min(multiprocessing.cpu_count(), 8)
+    else:
+        num_workers = int(workers_str)
+
     try:
-        secret_scanner.scan()
+        secret_scanner.scan(auto_approve=auto_approve, num_workers=num_workers)
     except KeyboardInterrupt:
         scanner.log_message("Keyboard interrupt detected. Saving findings and exiting...")
         sys.exit(130)
     except Exception as e:
-        scanner.log_message("Execution interrupted by an exception. Saving partial report and exiting...")
-        scanner.log_message(e)
+        # Surface CQL validation errors clearly
+        from n0s1.controllers.confluence_controller import CQLValidationError
+        if isinstance(e, CQLValidationError):
+            scanner.log_message(str(e), level=logging.ERROR)
+        else:
+            scanner.log_message("Execution interrupted by an exception. Saving partial report and exiting...")
+            scanner.log_message(e)
         sys.exit(1)
     finally:
         secret_scanner.save_report()

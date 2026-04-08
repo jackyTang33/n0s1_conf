@@ -1,3 +1,4 @@
+import concurrent.futures
 import hashlib
 import logging
 import json
@@ -5,6 +6,7 @@ import math
 import os
 import pathlib
 import re
+import sys
 import toml
 import yaml
 from datetime import datetime, timezone
@@ -528,7 +530,199 @@ class SecretScanner():
             return self.cfg
         return {}
 
-    def scan(self):
+    def prefetch_scan_data(self, scan_comment, limit):
+        """Pass 1: Collect all page data from the controller without running regex.
+
+        Returns a list of ticket dicts and a statistics dict.
+        """
+        pages = []
+        spaces_seen = set()
+        total_chars = 0
+        total_comments = 0
+
+        for ticket in self.controller.get_data(scan_comment, limit):
+            pages.append(ticket)
+            url = ticket.get("url", "")
+            # Derive space key from URL path (e.g. /wiki/spaces/SEC/...)
+            if "/spaces/" in url:
+                parts = url.split("/spaces/")
+                if len(parts) > 1:
+                    space_key = parts[1].split("/")[0]
+                    spaces_seen.add(space_key)
+            elif "/display/" in url:
+                parts = url.split("/display/")
+                if len(parts) > 1:
+                    space_key = parts[1].split("/")[0]
+                    spaces_seen.add(space_key)
+
+            ticket_data = ticket.get("ticket", {})
+            title_text = ticket_data.get("title", {}).get("data", "") or ""
+            desc_text = ticket_data.get("description", {}).get("data", "") or ""
+            comments_data = ticket_data.get("comments", {}).get("data", []) or []
+
+            total_chars += len(title_text) + len(desc_text)
+            for c in comments_data:
+                total_chars += len(c) if c else 0
+                total_comments += 1
+
+        stats = {
+            "spaces": sorted(spaces_seen),
+            "num_spaces": len(spaces_seen),
+            "num_pages": len(pages),
+            "num_comments": total_comments,
+            "total_chars": total_chars,
+            "total_mb": round(total_chars / (1024 * 1024), 2),
+        }
+        return pages, stats
+
+    def display_scan_summary(self, stats, cql_query=None):
+        """Display a formatted summary of the prefetched scan scope."""
+        num_rules = 0
+        if self.regex_config and "rules" in self.regex_config:
+            num_rules = len(self.regex_config["rules"])
+
+        # Rough heuristic: Python regex processes ~5 MB/s per rule
+        throughput_mbps = 5.0
+        total_mb = stats["total_mb"]
+        if num_rules > 0 and total_mb > 0:
+            est_seconds_low = (total_mb * num_rules) / (throughput_mbps * 2)
+            est_seconds_high = (total_mb * num_rules) / throughput_mbps
+        else:
+            est_seconds_low = 0
+            est_seconds_high = 0
+
+        def _fmt_duration(secs):
+            if secs < 60:
+                return f"~{int(secs)} seconds"
+            elif secs < 3600:
+                return f"~{int(secs / 60)} minutes"
+            else:
+                return f"~{secs / 3600:.1f} hours"
+
+        lines = [
+            "",
+            "============ Scan Scope Summary ============",
+        ]
+        if cql_query:
+            lines.append(f"CQL Query:            {cql_query}")
+        if stats["num_spaces"] > 0:
+            spaces_str = ", ".join(stats["spaces"])
+            lines.append(f"Spaces matched:       {stats['num_spaces']} ({spaces_str})")
+        lines.append(f"Pages to scan:        {stats['num_pages']:,}")
+        lines.append(f"Comments to scan:     {stats['num_comments']:,}")
+        lines.append(f"Total scannable text: ~{stats['total_mb']} MB ({stats['total_chars']:,} chars)")
+        lines.append(f"Regex rules loaded:   {num_rules}")
+        if est_seconds_high > 0:
+            lines.append(f"Est. scan duration:   {_fmt_duration(est_seconds_low)} – {_fmt_duration(est_seconds_high)}")
+        lines.append("============================================")
+        lines.append("")
+
+        summary = "\n".join(lines)
+        self.log_message(summary)
+        return summary
+
+    def prompt_user_approval(self, auto_approve=False):
+        """Interactive breakpoint: ask the user to approve the scan.
+
+        Returns True to proceed, False to abort.
+        If auto_approve is True or stdin is not a TTY, proceeds automatically.
+        """
+        if auto_approve:
+            self.log_message("Auto-approve enabled (--yes). Proceeding with scan.")
+            return True
+
+        if not sys.stdin.isatty():
+            self.log_message("Non-interactive mode detected, proceeding automatically.")
+            return True
+
+        try:
+            answer = input("Proceed with scan? [Y/n]: ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            self.log_message("Scan aborted by user.")
+            return False
+
+        if answer in ("", "y", "yes"):
+            return True
+        else:
+            self.log_message("Scan aborted by user.")
+            return False
+
+    def scan_pages_parallel(self, pages, num_workers):
+        """Pass 2 with parallelism: scan prefetched pages using ProcessPoolExecutor.
+
+        Each worker scans a chunk of pages for regex matches. Results are collected
+        and reported back in the main process.
+        """
+        if num_workers <= 1 or len(pages) == 0:
+            # Sequential path – no overhead
+            self._scan_pages_sequential(pages)
+            return
+
+        # Partition pages into chunks
+        chunk_size = max(1, len(pages) // num_workers)
+        chunks = []
+        for i in range(0, len(pages), chunk_size):
+            chunks.append(pages[i:i + chunk_size])
+
+        actual_workers = min(num_workers, len(chunks))
+        self.log_message(f"Scanning with {actual_workers} worker process(es) across {len(chunks)} chunk(s)...")
+
+        label = self.cfg.get("comment_params", {}).get("label", "") if self.cfg else ""
+        regex_config = self.regex_config
+
+        futures = {}
+        with concurrent.futures.ProcessPoolExecutor(max_workers=actual_workers) as executor:
+            for idx, chunk in enumerate(chunks):
+                future = executor.submit(_worker_scan_chunk, chunk, regex_config, label)
+                futures[future] = idx
+
+            for future in concurrent.futures.as_completed(futures):
+                chunk_idx = futures[future]
+                try:
+                    results = future.result()
+                    for result in results:
+                        result["scan_arguments"] = self.scan_arguments
+                        if result.get("secret_found"):
+                            self.report_leaked_secret(result)
+                except Exception as e:
+                    self.log_message(
+                        f"Worker {chunk_idx} failed: {e}", level=logging.ERROR
+                    )
+
+    def _scan_pages_sequential(self, pages):
+        """Scan prefetched pages sequentially (the original single-threaded path)."""
+        post_comment = self.scan_arguments.get("post_comment", False)
+        label = self.cfg.get("comment_params", {}).get("label", "") if self.cfg else ""
+
+        for ticket in pages:
+            issue_id = ticket.get("issue_id")
+            url = ticket.get("url")
+            if self.debug:
+                self.log_message(f"Scanning [{issue_id}]: {url}")
+
+            comments = ticket.get("ticket", {}).get("comments", {}).get("data", [])
+            post_comment_for_this_issue = post_comment
+            if post_comment_for_this_issue:
+                for comment in comments:
+                    if comment.lower().find(label.lower()) != -1:
+                        post_comment_for_this_issue = False
+                        break
+            self.scan_arguments["post_comment"] = post_comment_for_this_issue
+
+            for key in ticket.get("ticket", {}):
+                item = ticket.get("ticket", {}).get(key, {})
+                name = item.get("name", "")
+                data = item.get("data", None)
+                data_type = item.get("data_type", None)
+                if data_type and data_type.lower() == "str".lower():
+                    if data and data.lower().find(label.lower()) == -1:
+                        self.scan_text_and_report_leaks(data, name, self.regex_config, self.scan_arguments, ticket)
+                elif data_type:
+                    for item_data in data:
+                        if item_data and item_data.lower().find(label.lower()) == -1:
+                            self.scan_text_and_report_leaks(item_data, name, self.regex_config, self.scan_arguments, ticket)
+
+    def scan(self, auto_approve=False, num_workers=1):
 
         N0S1_TOKEN = os.getenv("N0S1_TOKEN")
         n0s1_pro = spark1.Spark1(token_auth=N0S1_TOKEN)
@@ -546,36 +740,67 @@ class SecretScanner():
         post_comment = self.scan_arguments.get("post_comment", False)
         limit = self.scan_arguments.get("limit", None)
 
-        for ticket in self.controller.get_data(scan_comment, limit):
-            issue_id = ticket.get("issue_id")
-            url = ticket.get("url")
-            if self.debug:
-                self.log_message(f"Scanning [{issue_id}]: {url}")
+        # Determine if this is a Confluence scan with CQL scope
+        is_confluence = self.controller.get_name().lower() == "confluence"
+        cql_query = None
+        if is_confluence and self.scope_config:
+            cql_query = self.controller.get_query_from_scope()
 
-            comments = ticket.get("ticket", {}).get("comments", {}).get("data", [])
-            label = self.cfg.get("comment_params", {}).get("label", "")
-            post_comment_for_this_issue = post_comment
-            if post_comment_for_this_issue:
-                for comment in comments:
-                    if comment.lower().find(label.lower()) != -1:
-                        # Comment with leak warning has been already posted. Skip
-                        # posting a new comment again
-                        post_comment_for_this_issue = False
-                        break
-            self.scan_arguments["post_comment"] = post_comment_for_this_issue
+        # Layer 1: Early CQL validation (fail fast)
+        if is_confluence and cql_query:
+            self.log_message(f"Validating CQL query: {cql_query}")
+            self.controller.validate_cql(cql_query)
 
-            for key in ticket.get("ticket", {}):
-                item = ticket.get("ticket", {}).get(key, {})
-                name = item.get("name", "")
-                data = item.get("data", None)
-                data_type = item.get("data_type", None)
-                if data_type and data_type.lower() == "str".lower():
-                    if data and data.lower().find(label.lower()) == -1:
-                        self.scan_text_and_report_leaks(data, name, self.regex_config, self.scan_arguments, ticket)
-                elif data_type:
-                    for item_data in data:
-                        if item_data and item_data.lower().find(label.lower()) == -1:
-                            self.scan_text_and_report_leaks(item_data, name, self.regex_config, self.scan_arguments, ticket)
+        # Two-pass approach: prefetch → summarize → approve → scan
+        if is_confluence:
+            self.log_message("Prefetching page data...")
+            pages, stats = self.prefetch_scan_data(scan_comment, limit)
+
+            if stats["num_pages"] == 0:
+                self.log_message("No pages found to scan.")
+                return self.report_json
+
+            self.display_scan_summary(stats, cql_query=cql_query)
+
+            if not self.prompt_user_approval(auto_approve=auto_approve):
+                return self.report_json
+
+            # Pass 2: Regex scan on collected pages
+            self.log_message("Starting regex scan...")
+            if num_workers > 1:
+                self.scan_pages_parallel(pages, num_workers)
+            else:
+                self._scan_pages_sequential(pages)
+        else:
+            # Original single-pass flow for non-Confluence platforms
+            for ticket in self.controller.get_data(scan_comment, limit):
+                issue_id = ticket.get("issue_id")
+                url = ticket.get("url")
+                if self.debug:
+                    self.log_message(f"Scanning [{issue_id}]: {url}")
+
+                comments = ticket.get("ticket", {}).get("comments", {}).get("data", [])
+                label = self.cfg.get("comment_params", {}).get("label", "")
+                post_comment_for_this_issue = post_comment
+                if post_comment_for_this_issue:
+                    for comment in comments:
+                        if comment.lower().find(label.lower()) != -1:
+                            post_comment_for_this_issue = False
+                            break
+                self.scan_arguments["post_comment"] = post_comment_for_this_issue
+
+                for key in ticket.get("ticket", {}):
+                    item = ticket.get("ticket", {}).get(key, {})
+                    name = item.get("name", "")
+                    data = item.get("data", None)
+                    data_type = item.get("data_type", None)
+                    if data_type and data_type.lower() == "str".lower():
+                        if data and data.lower().find(label.lower()) == -1:
+                            self.scan_text_and_report_leaks(data, name, self.regex_config, self.scan_arguments, ticket)
+                    elif data_type:
+                        for item_data in data:
+                            if item_data and item_data.lower().find(label.lower()) == -1:
+                                self.scan_text_and_report_leaks(item_data, name, self.regex_config, self.scan_arguments, ticket)
         return self.report_json
 
     def scan_text_and_report_leaks(self, data, name, regex_config, scan_arguments, ticket):
@@ -679,5 +904,40 @@ def scan_text(regex_config, text):
         if DEBUG:
             log_message(str(e), level=logging.WARNING)
     return match, scan_text_result
+
+
+def _worker_scan_chunk(pages, regex_config, label):
+    """Top-level function for ProcessPoolExecutor workers.
+
+    Scans a chunk of prefetched pages against regex_config and returns a list
+    of scan results for any matches found.  Must be defined at module level
+    so that it can be pickled across process boundaries.
+    """
+    results = []
+    for ticket in pages:
+        for key in ticket.get("ticket", {}):
+            item = ticket.get("ticket", {}).get(key, {})
+            name = item.get("name", "")
+            data = item.get("data", None)
+            data_type = item.get("data_type", None)
+
+            texts_to_scan = []
+            if data_type and data_type.lower() == "str":
+                if data and data.lower().find(label.lower()) == -1:
+                    texts_to_scan.append(data)
+            elif data_type and data:
+                for item_data in data:
+                    if item_data and item_data.lower().find(label.lower()) == -1:
+                        texts_to_scan.append(item_data)
+
+            for text in texts_to_scan:
+                secret_found, scan_text_result = scan_text(regex_config, text)
+                if secret_found:
+                    scan_text_result["ticket_data"] = ticket
+                    scan_text_result["ticket_data"]["field"] = name
+                    scan_text_result["ticket_data"]["platform"] = "Confluence"
+                    scan_text_result["secret_found"] = True
+                    results.append(scan_text_result)
+    return results
 
 
