@@ -381,22 +381,24 @@ class ConfluenceSecretScanner:
                     self._record_finding(result)
 
     def _record_finding(self, result):
-        sanitized = result.get("sanitized_secret", "")
+        redacted_secret = result.get("sanitized_secret", "")  # already <REDACTED> by _sanitize()
         url = result.get("ticket_data", {}).get("url", "")
         rule = result.get("matched_regex_config", {})
 
         logger.warning(
-            "Potential secret leak! Rule: [%s] %s\n  Sanitized: %s\n  Source: %s",
-            rule.get("id", ""), rule.get("description", ""), sanitized, url,
+            "Potential secret leak! Rule: [%s] %s\n  Redacted: %s\n  Source: %s",
+            rule.get("id", ""), rule.get("description", ""), redacted_secret, url,
         )
         if self.show_secrets:
-            logger.warning("  Raw snippet: %s", result.get("snippet_text", ""))
+            # User explicitly opted in with --show-secrets (CAUTION flag)
+            snippet = result.get("snippet_text", "")
+            logger.warning("  Raw snippet: %s", snippet)
 
-        fid = _sha256(f"{url}_{sanitized}")
+        fid = _sha256(f"{url}_{redacted_secret}")
         self.report["findings"][fid] = {
             "id": fid,
             "url": url,
-            "secret": sanitized,
+            "secret": redacted_secret,
             "details": {
                 "matched_regex_config": rule,
                 "platform": "Confluence",
