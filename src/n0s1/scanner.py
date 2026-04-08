@@ -32,6 +32,7 @@ except:
     import n0s1.reporting.report_gitlab as report_gitlab
 
 global n0s1_version, DEBUG
+DEBUG = False
 
 try:
     here = pathlib.Path(__file__).parent.resolve()
