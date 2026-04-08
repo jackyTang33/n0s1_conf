@@ -9,6 +9,26 @@ except Exception:
     import n0s1.controllers.hollow_controller as hollow_controller
 
 
+class CQLValidationError(Exception):
+    """Base exception for CQL validation failures."""
+    pass
+
+
+class CQLSyntaxError(CQLValidationError):
+    """Raised when the Confluence API returns an HTTP 400 for a malformed CQL query."""
+    pass
+
+
+class CQLPermissionError(CQLValidationError):
+    """Raised when the Confluence API returns an HTTP 403 for the CQL query."""
+    pass
+
+
+class CQLEmptyResultError(CQLValidationError):
+    """Raised when a CQL query is syntactically valid but returns zero pages."""
+    pass
+
+
 class ConfluenceController(hollow_controller.HollowController):
     def __init__(self):
         super().__init__()
@@ -87,6 +107,53 @@ class ConfluenceController(hollow_controller.HollowController):
             else:
                 self.log_message(f"Unable to connect to {self.get_name()} instance. Check your credentials.", logging.ERROR)
         return False
+
+    def validate_cql(self, cql, limit=1):
+        """Validate a CQL query with a cheap single-result probe.
+
+        Raises:
+            CQLSyntaxError: HTTP 400 – malformed CQL.
+            CQLPermissionError: HTTP 403 – insufficient permissions.
+            CQLEmptyResultError: valid CQL but zero page results.
+            CQLValidationError: any other unexpected error from the API.
+        """
+        import requests as _requests
+
+        try:
+            res = self._client.cql(cql, limit=limit)
+        except _requests.exceptions.HTTPError as exc:
+            status = getattr(exc.response, "status_code", None)
+            api_msg = ""
+            if exc.response is not None:
+                try:
+                    api_msg = exc.response.json().get("message", str(exc))
+                except Exception:
+                    api_msg = exc.response.text or str(exc)
+            if status == 400:
+                raise CQLSyntaxError(f"CQL syntax error: {api_msg}") from exc
+            elif status == 403:
+                raise CQLPermissionError(f"Insufficient permissions for CQL query: {api_msg}") from exc
+            else:
+                raise CQLValidationError(f"CQL validation failed (HTTP {status}): {api_msg}") from exc
+        except _requests.exceptions.ConnectionError as exc:
+            raise CQLValidationError(f"Connection error during CQL validation: {exc}") from exc
+        except Exception as exc:
+            raise CQLValidationError(f"Unexpected error during CQL validation: {exc}") from exc
+
+        # Check that the query actually returned page-type results
+        pages_found = 0
+        for r in res.get("results", []):
+            content_type = r.get("content", {}).get("type", None)
+            if content_type and content_type.lower() == "page":
+                pages_found += 1
+
+        if pages_found == 0:
+            raise CQLEmptyResultError(
+                f"CQL query returned 0 page results: '{cql}'. Nothing to scan."
+            )
+
+        self.log_message(f"CQL query validated successfully (probe returned {pages_found} page(s)).")
+        return True
 
     def _get_workspaces(self, limit=None):
         if self._scan_scope:
@@ -186,6 +253,7 @@ class ConfluenceController(hollow_controller.HollowController):
         using_cql = False
         cql = self.get_query_from_scope()
         if cql:
+            import requests as _requests
             try:
                 res = self._client.cql(cql, limit=limit)
                 while res:
@@ -195,10 +263,10 @@ class ConfluenceController(hollow_controller.HollowController):
                         if content_type and content_type.lower() == "page".lower():
                             pages.append(r.get("content", {}))
 
-                    next = res.get("_links", {}).get("next", None)
+                    next_link = res.get("_links", {}).get("next", None)
                     res = None
-                    if next:
-                        url = f"{self._url}/wiki{next}"
+                    if next_link:
+                        url = f"{self._url}/wiki{next_link}"
                         response = self._get_request(url)
                         if response:
                             res = response.json()
@@ -207,12 +275,27 @@ class ConfluenceController(hollow_controller.HollowController):
                     using_cql = True
                     yield from self.process_pages(include_coments, limit, pages)
                 else:
-                    message = f"No pages found for [cql:{cql}]. Scan will not be scoped."
-                    self.log_message(message, logging.WARNING)
-                    self._scan_scope = None
+                    raise CQLEmptyResultError(
+                        f"CQL query returned 0 page results: '{cql}'. Nothing to scan."
+                    )
+            except (CQLValidationError, CQLSyntaxError, CQLPermissionError, CQLEmptyResultError):
+                raise
+            except _requests.exceptions.HTTPError as exc:
+                status = getattr(exc.response, "status_code", None)
+                api_msg = ""
+                if exc.response is not None:
+                    try:
+                        api_msg = exc.response.json().get("message", str(exc))
+                    except Exception:
+                        api_msg = exc.response.text or str(exc)
+                if status == 400:
+                    raise CQLSyntaxError(f"CQL syntax error: {api_msg}") from exc
+                elif status == 403:
+                    raise CQLPermissionError(f"Insufficient permissions for CQL query: {api_msg}") from exc
+                else:
+                    raise CQLValidationError(f"CQL query failed (HTTP {status}): {api_msg}") from exc
             except Exception as e:
-                message = str(e) + f" cql({cql}, limit={limit})"
-                self.log_message(message, logging.WARNING)
+                raise CQLValidationError(f"CQL query failed: {e}") from e
 
         if using_cql:
             return
