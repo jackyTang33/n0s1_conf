@@ -63,7 +63,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--show-secrets", dest="show_secrets", action="store_true",
                    help="Show raw matched secrets in logs (CAUTION: may leak sensitive data)")
     p.add_argument("--timeout", type=int, default=None, help="HTTP request timeout in seconds")
-    p.add_argument("--limit",   type=int, default=None, help="Max pages per HTTP request")
+    p.add_argument("--limit",   type=int, default=None, help="Max total pages to scan (default: unlimited)")
     p.add_argument("--insecure", action="store_true", help="Disable SSL certificate verification")
     p.add_argument("--debug",    action="store_true", help="Enable debug logging")
 

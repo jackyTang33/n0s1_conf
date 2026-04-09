@@ -51,6 +51,12 @@ python -m confluence_scanner.main --scope "cql: space=\"ACC\" AND ancestor = 938
 
 # Skip comment scanning:
 python -m confluence_scanner.main --skip-comments --yes
+
+# v4.0 hit
+python -m confluence_scanner.main --scope "cql: space in (ATLASSIAN,EWEAG,JTP,AAF) and type=page" --yes --workers 4 --limit 500 --show-secrets --report-file confluence-secrets-v3.3-self.
+
+
+
 ```
 
 ## CLI Reference

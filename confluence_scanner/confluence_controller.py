@@ -6,7 +6,11 @@ Self-contained: no base-class inheritance, no platform factory.
 """
 
 import logging
+import random
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from html import unescape as _html_unescape
 from html.parser import HTMLParser
 
 import requests
@@ -14,6 +18,30 @@ from requests.auth import HTTPBasicAuth
 from atlassian import Confluence
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Reusable HTML-to-text extractor (module-level to avoid re-definition per call)
+# ---------------------------------------------------------------------------
+
+class _HtmlTextExtractor(HTMLParser):
+    """Extract visible text from Confluence storage-format HTML."""
+
+    def __init__(self):
+        super().__init__()
+        self._pieces: list[str] = []
+
+    def handle_data(self, data):
+        self._pieces.append(data)
+
+    def handle_entityref(self, name):
+        self._pieces.append(_html_unescape(f"&{name};"))
+
+    def handle_charref(self, name):
+        self._pieces.append(_html_unescape(f"&#{name};"))
+
+    def get_text(self) -> str:
+        return " ".join(self._pieces)
 
 
 # ---------------------------------------------------------------------------
@@ -63,6 +91,7 @@ class ConfluenceController:
         self._password: str = ""
         self._requests_counter = 0
         self._check_connection_after = 200
+        self._lock = threading.Lock()
 
     # ---- configuration & connection ----------------------------------------
 
@@ -94,12 +123,17 @@ class ConfluenceController:
 
     def _reconnect_if_needed(self):
         """Periodically re-check the connection after many requests."""
-        self._requests_counter += 1
-        if self._requests_counter > self._check_connection_after:
-            self._requests_counter = 0
-            if not self.is_connected():
+        with self._lock:
+            self._requests_counter += 1
+            if self._requests_counter > self._check_connection_after:
+                self._requests_counter = 0
+                needs_reconnect = not self.is_connected()
+            else:
+                needs_reconnect = False
+        if needs_reconnect:
+            with self._lock:
                 self._client = None
-                self.set_config(self._config)
+            self.set_config(self._config)
 
     def is_connected(self) -> bool:
         """Verify credentials and basic read permissions."""
@@ -170,7 +204,8 @@ class ConfluenceController:
 
     # ---- data fetching -----------------------------------------------------
 
-    def get_data(self, include_comments: bool = False, limit: int | None = None):
+    def get_data(self, include_comments: bool = False, limit: int | None = None,
+                 max_fetch_workers: int = 1):
         """Yield page dicts.  Routes through CQL if a scope query is set,
         otherwise iterates all spaces/pages."""
         if not self._client:
@@ -178,21 +213,26 @@ class ConfluenceController:
 
         cql = self._get_cql_from_scope()
         if cql:
-            yield from self._get_data_via_cql(cql, include_comments, limit)
+            yield from self._get_data_via_cql(cql, include_comments, limit, max_fetch_workers)
         else:
-            yield from self._get_data_all_spaces(include_comments, limit)
+            yield from self._get_data_all_spaces(include_comments, limit, max_fetch_workers)
 
-    def _get_data_via_cql(self, cql, include_comments, limit):
+    def _get_data_via_cql(self, cql, include_comments, limit, max_fetch_workers=1):
         """Fetch pages matching a CQL query.  Never falls back to unscoped."""
+        _BATCH = 500  # CQL pagination page size (internal)
         pages = []
         try:
-            res = self._client.cql(cql, limit=limit)
+            res = self._client.cql(cql, limit=_BATCH)
             while res:
                 for r in res.get("results", []):
                     # Can be replaced by adding a "and type=page" to the CQL; currently works as extra safety check
                     ctype = (r.get("content", {}).get("type") or "").lower()
                     if ctype == "page":
                         pages.append(r["content"])
+
+                if limit and len(pages) >= limit:
+                    pages = pages[:limit]
+                    break
 
                 next_link = res.get("_links", {}).get("next")
                 res = None
@@ -204,7 +244,10 @@ class ConfluenceController:
             if not pages:
                 raise CQLEmptyResultError(f"CQL query returned 0 page results: '{cql}'. Nothing to scan.")
 
-            yield from self._process_pages(pages, include_comments, limit)
+            if limit:
+                logger.info("Limit applied: scanning %d/%d matched pages", len(pages), len(pages))
+
+            yield from self._process_pages(pages, include_comments, max_fetch_workers)
 
         except (CQLValidationError, CQLSyntaxError, CQLPermissionError, CQLEmptyResultError):
             raise
@@ -213,50 +256,61 @@ class ConfluenceController:
         except Exception as e:
             raise CQLValidationError(f"CQL query failed: {e}") from e
 
-    def _get_data_all_spaces(self, include_comments, limit):
+    def _get_data_all_spaces(self, include_comments, limit, max_fetch_workers=1):
         """Iterate every space & page when no CQL scope is provided."""
-        for space_batch in self._iter_spaces(limit):
+        total_yielded = 0
+        for space_batch in self._iter_spaces():
             for space in space_batch:
                 key = space if isinstance(space, str) else space.get("key", "")
                 if not key:
                     continue
                 logger.info("Scanning Confluence space: [%s]...", key)
-                for page_batch in self._iter_pages(key, limit):
-                    yield from self._process_pages(page_batch, include_comments, limit)
+                for page_batch in self._iter_pages(key):
+                    if limit:
+                        remaining = limit - total_yielded
+                        if remaining <= 0:
+                            return
+                        page_batch = page_batch[:remaining]
+                    for result in self._process_pages(page_batch, include_comments, max_fetch_workers):
+                        yield result
+                        total_yielded += 1
+                        if limit and total_yielded >= limit:
+                            return
 
     # ---- internal iterators ------------------------------------------------
 
-    def _iter_spaces(self, limit=None):
+    def _iter_spaces(self):
         if self._scan_scope and "workspaces" in self._scan_scope:
             yield list(self._scan_scope["workspaces"].keys())
             return
 
-        limit = limit or 50
+        _BATCH = 50
         start = 0
         while True:
             try:
                 self._reconnect_if_needed()
-                res = self._client.get_all_spaces(start=start, limit=limit)
+                res = self._client.get_all_spaces(start=start, limit=_BATCH)
                 spaces = res.get("results", [])
             except Exception as e:
-                logger.warning("%s  get_all_spaces(start=%d, limit=%d)", e, start, limit)
+                logger.warning("%s  get_all_spaces(start=%d, limit=%d)", e, start, _BATCH)
                 time.sleep(1)
                 continue
             if not spaces:
                 break
             yield spaces
-            start += limit
+            start += _BATCH
 
-    def _iter_pages(self, space_key, limit=None):
+    def _iter_pages(self, space_key):
         from atlassian.confluence import ApiPermissionError
 
+        _BATCH = 50
         if self._scan_scope:
             page_keys = self._scan_scope.get("workspaces", {}).get(space_key, {})
             if page_keys:
                 batch = []
                 for pk in page_keys:
                     batch.append(self._client.get_page_by_id(pk))
-                    if len(batch) >= (limit or 50):
+                    if len(batch) >= _BATCH:
                         yield batch
                         batch = []
                 if batch:
@@ -266,12 +320,11 @@ class ConfluenceController:
         if not space_key:
             return
 
-        limit = limit or 50
         start = 0
         while True:
             try:
                 self._reconnect_if_needed()
-                pages = self._client.get_all_pages_from_space(space_key, start=start, limit=limit)
+                pages = self._client.get_all_pages_from_space(space_key, start=start, limit=_BATCH)
             except ApiPermissionError as e:
                 logger.warning("%s  Skipping space %s.", e, space_key)
                 break
@@ -282,35 +335,136 @@ class ConfluenceController:
             if not pages:
                 break
             yield pages
-            start += limit
+            start += _BATCH
 
-    def _process_pages(self, pages, include_comments, limit):
+    def _process_pages(self, pages, include_comments, max_workers=1):
         """For each raw page dict, fetch full body & comments and yield a
-        normalised ticket dict."""
-        limit = limit or 50
-        for p in pages:
-            page_id = p.get("id", "")
-            title = p.get("title", "")
+        normalised ticket dict.
+
+        When *max_workers* > 1, pages are fetched concurrently using a
+        ThreadPoolExecutor (I/O-bound work — GIL releases during HTTP).
+        """
+        _COMMENT_BATCH = 50
+        total = len(pages)
+        if total == 0:
+            return
+
+        actual_workers = min(max(max_workers, 1), total, 8)
+
+        # Adaptive log interval: ~20 log lines for any size, min 10, max 500
+        log_interval = max(10, min(500, total // 20)) if total > 20 else 1
+
+        if actual_workers <= 1:
+            # --- sequential path (no threading overhead) ---
+            for idx, p in enumerate(pages, 1):
+                result = self._fetch_one_page(p, include_comments, _COMMENT_BATCH)
+                if idx % log_interval == 0 or idx == total:
+                    logger.info("Fetched %d/%d pages", idx, total)
+                if result is not None:
+                    yield result
+            return
+
+        # --- parallel path ---
+        logger.info("Starting parallel page fetch: %d pages with %d workers", total, actual_workers)
+
+        lock = threading.Lock()
+        initiated = 0
+        completed = 0
+        succeeded = 0
+        results: dict[int, dict | None] = {}
+
+        def _on_submit():
+            nonlocal initiated
+            with lock:
+                initiated += 1
+                n = initiated
+            if n % log_interval == 0 or n == total:
+                logger.info("Initiated %d/%d pages", n, total)
+
+        def _on_complete(ok: bool):
+            nonlocal completed, succeeded
+            with lock:
+                completed += 1
+                if ok:
+                    succeeded += 1
+                n, s = completed, succeeded
+            if n % log_interval == 0 or n == total:
+                logger.info("Fetched %d/%d pages (%d succeeded)", n, total, s)
+
+        with ThreadPoolExecutor(max_workers=actual_workers) as pool:
+            futures = {}
+            for idx, p in enumerate(pages):
+                fut = pool.submit(self._fetch_one_page, p, include_comments, _COMMENT_BATCH)
+                futures[fut] = idx
+                _on_submit()
+
+            for fut in as_completed(futures):
+                result = fut.result()
+                _on_complete(result is not None)
+                idx = futures[fut]
+                results[idx] = result
+
+        logger.info("Page fetch complete: %d/%d pages fetched successfully", succeeded, total)
+
+        # Yield in original submission order for deterministic output
+        for idx in range(total):
+            if results.get(idx) is not None:
+                yield results[idx]
+
+    def _fetch_one_page(self, page, include_comments, limit):
+        """Fetch body & comments for a single page.  Returns a packed dict or None.
+
+        Safe to call from worker threads — uses _api_call_with_retry for
+        rate-limit handling (HTTP 429).
+        """
+        page_id = page.get("id", "")
+        title = page.get("title", "")
+        try:
+            body = self._api_call_with_retry(
+                self._client.get_page_by_id, page_id, expand="body.storage"
+            )
+        except Exception as e:
+            logger.warning("%s  get_page_by_id(%s)", e, page_id)
+            return None
+
+        description = self._strip_html(body.get("body", {}).get("storage", {}).get("value", ""))
+        url = body.get("_links", {}).get("base", "") + page.get("_links", {}).get("webui", "")
+
+        comments = []
+        if page_id and include_comments:
+            comments = self._fetch_comments(page_id, limit)
+
+        return self._pack(title, description, comments, url, page_id)
+
+    def _api_call_with_retry(self, func, *args, max_retries=3, **kwargs):
+        """Call *func* with retry on HTTP 429 (rate limited).
+
+        Uses exponential backoff with jitter.  Other exceptions propagate
+        immediately.
+        """
+        for attempt in range(max_retries + 1):
             try:
-                self._reconnect_if_needed()
-                body = self._client.get_page_by_id(page_id, expand="body.storage")
-            except Exception as e:
-                logger.warning("%s  get_page_by_id(%s)", e, page_id)
-                time.sleep(1)
-                continue
+                return func(*args, **kwargs)
+            except requests.exceptions.HTTPError as exc:
+                status = getattr(exc.response, "status_code", None)
+                if status == 429 and attempt < max_retries:
+                    retry_after = exc.response.headers.get("Retry-After")
+                    if retry_after:
+                        delay = float(retry_after)
+                    else:
+                        delay = (2 ** attempt) + random.uniform(0, 1)
+                    logger.warning(
+                        "Rate limited (429). Retry %d/%d after %.1fs",
+                        attempt + 1, max_retries, delay,
+                    )
+                    time.sleep(delay)
+                    continue
+                raise
 
-            description = self._strip_html(body.get("body", {}).get("storage", {}).get("value", ""))
-            url = body.get("_links", {}).get("base", "") + p.get("_links", {}).get("webui", "")
-
-            comments = []
-            if page_id and include_comments:
-                comments = self._fetch_comments(page_id, limit)
-
-            yield self._pack(title, description, comments, url, page_id)
-
-    def _fetch_comments(self, page_id, limit):
+    def _fetch_comments(self, page_id, limit, max_retries=3):
         comments = []
         start = 0
+        consecutive_errors = 0
         while True:
             try:
                 self._reconnect_if_needed()
@@ -318,8 +472,17 @@ class ConfluenceController:
                     page_id, expand="body.storage", start=start, limit=limit
                 )
                 results = resp.get("results", [])
+                consecutive_errors = 0  # reset on success
             except Exception as e:
+                consecutive_errors += 1
                 logger.warning("%s  get_page_comments(%s, start=%d)", e, page_id, start)
+                if consecutive_errors >= max_retries:
+                    logger.warning(
+                        "Giving up on comments for page %s after %d consecutive errors. "
+                        "Returning %d comment(s) fetched so far.",
+                        page_id, consecutive_errors, len(comments),
+                    )
+                    break
                 time.sleep(1)
                 continue
             if not results:
@@ -358,26 +521,9 @@ class ConfluenceController:
         """Extract visible text from Confluence storage-format HTML."""
         if not html:
             return html
-
-        class _Extractor(HTMLParser):
-            def __init__(self):
-                super().__init__()
-                self._pieces: list[str] = []
-
-            def handle_data(self, data):
-                self._pieces.append(data)
-
-            def handle_entityref(self, name):
-                from html import unescape
-                self._pieces.append(unescape(f"&{name};"))
-
-            def handle_charref(self, name):
-                from html import unescape
-                self._pieces.append(unescape(f"&#{name};"))
-
-        extractor = _Extractor()
+        extractor = _HtmlTextExtractor()
         extractor.feed(html)
-        return " ".join(extractor._pieces)
+        return extractor.get_text()
 
     @staticmethod
     def _pack(title, description, comments, url, page_id):
@@ -399,5 +545,5 @@ class ConfluenceController:
             headers["Authorization"] = f"Bearer {self._password}"
             return requests.get(url, headers=headers)
         except Exception as e:
-            logger.warning(str(e))
+            logger.warning("%s requesting %s: %s", type(e).__name__, url, e)
         return None

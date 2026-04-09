@@ -116,13 +116,13 @@ class TestRegexScanning(unittest.TestCase):
     RULES = {"rules": [{"id": "ghp", "description": "GitHub PAT", "regex": r"ghp_[A-Za-z0-9]{36}"}]}
 
     def test_match(self):
-        found, result = scan_text(self.RULES, "token: ghp_ABCDEFghijklmnop1234567890abcdef1234")
-        self.assertTrue(found)
-        self.assertIn("REDACTED", result["sanitized_secret"])
+        results = scan_text(self.RULES, "token: ghp_ABCDEFghijklmnop1234567890abcdef1234")
+        self.assertEqual(len(results), 1)
+        self.assertIn("REDACTED", results[0]["sanitized_secret"])
 
     def test_no_match(self):
-        found, result = scan_text(self.RULES, "nothing here")
-        self.assertFalse(found)
+        results = scan_text(self.RULES, "nothing here")
+        self.assertEqual(len(results), 0)
 
 
 # ===== Worker chunk scanner =====
@@ -385,6 +385,188 @@ rules: []
         scanner.report = {"tool": "confluence_scanner", "findings": {}}
         scanner._load_regex_config()
         self.assertIsNone(scanner.regex_config)
+
+
+# ===== Parallel page fetching =====
+
+class _FakePage:
+    """Helper to build a minimal page stub + mock API responses."""
+
+    @staticmethod
+    def stub(page_id, title="Page"):
+        return {"id": page_id, "title": title, "_links": {"webui": f"/pages/{page_id}"}}
+
+    @staticmethod
+    def body(page_id, html="<p>body</p>"):
+        return {
+            "body": {"storage": {"value": html}},
+            "_links": {"base": "https://wiki.example.com"},
+        }
+
+    @staticmethod
+    def comments(texts=None):
+        if not texts:
+            return {"results": []}
+        return {"results": [{"body": {"storage": {"value": f"<p>{t}</p>"}}} for t in texts]}
+
+
+class TestProcessPagesParallel(unittest.TestCase):
+    """Tests for _process_pages with max_workers > 1."""
+
+    def _ctrl(self):
+        c = ConfluenceController()
+        c._client = MagicMock()
+        c._url = "https://example.atlassian.net"
+        return c
+
+    def test_parallel_fetches_all_pages(self):
+        c = self._ctrl()
+        stubs = [_FakePage.stub(str(i), f"Page {i}") for i in range(10)]
+        c._client.get_page_by_id.side_effect = lambda pid, **kw: _FakePage.body(pid)
+        c._client.get_page_comments.return_value = _FakePage.comments()
+
+        results = list(c._process_pages(stubs, include_comments=True, max_workers=4))
+        self.assertEqual(len(results), 10)
+        ids = {r["issue_id"] for r in results}
+        self.assertEqual(ids, {str(i) for i in range(10)})
+
+    def test_sequential_fallback_identical(self):
+        c = self._ctrl()
+        stubs = [_FakePage.stub(str(i), f"Page {i}") for i in range(5)]
+        c._client.get_page_by_id.side_effect = lambda pid, **kw: _FakePage.body(pid)
+        c._client.get_page_comments.return_value = _FakePage.comments()
+
+        sequential = list(c._process_pages(stubs, include_comments=False, max_workers=1))
+        # Re-create controller to reset any state
+        c2 = self._ctrl()
+        c2._client.get_page_by_id.side_effect = lambda pid, **kw: _FakePage.body(pid)
+        c2._client.get_page_comments.return_value = _FakePage.comments()
+        parallel = list(c2._process_pages(stubs, include_comments=False, max_workers=4))
+
+        self.assertEqual(len(sequential), len(parallel))
+        seq_ids = [r["issue_id"] for r in sequential]
+        par_ids = [r["issue_id"] for r in parallel]
+        self.assertEqual(sorted(seq_ids), sorted(par_ids))
+
+    def test_failed_page_skipped_not_fatal(self):
+        c = self._ctrl()
+        stubs = [_FakePage.stub("ok"), _FakePage.stub("fail"), _FakePage.stub("ok2")]
+
+        def fake_get(pid, **kw):
+            if pid == "fail":
+                raise RuntimeError("boom")
+            return _FakePage.body(pid)
+
+        c._client.get_page_by_id.side_effect = fake_get
+        c._client.get_page_comments.return_value = _FakePage.comments()
+
+        results = list(c._process_pages(stubs, include_comments=False, max_workers=2))
+        ids = {r["issue_id"] for r in results}
+        self.assertIn("ok", ids)
+        self.assertIn("ok2", ids)
+        self.assertNotIn("fail", ids)
+
+    def test_preserves_submission_order(self):
+        c = self._ctrl()
+        stubs = [_FakePage.stub(str(i)) for i in range(20)]
+        c._client.get_page_by_id.side_effect = lambda pid, **kw: _FakePage.body(pid)
+        c._client.get_page_comments.return_value = _FakePage.comments()
+
+        results = list(c._process_pages(stubs, include_comments=False, max_workers=4))
+        ids = [r["issue_id"] for r in results]
+        self.assertEqual(ids, [str(i) for i in range(20)])
+
+
+class TestApiCallWithRetry(unittest.TestCase):
+    """Tests for _api_call_with_retry (HTTP 429 handling)."""
+
+    def _ctrl(self):
+        c = ConfluenceController()
+        c._client = MagicMock()
+        c._url = "https://example.atlassian.net"
+        return c
+
+    def test_retry_on_429_then_succeed(self):
+        import requests as req
+        c = self._ctrl()
+
+        resp_429 = MagicMock(status_code=429, headers={"Retry-After": "0"})
+        err_429 = req.exceptions.HTTPError(response=resp_429)
+
+        call_count = 0
+        def fake_func(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                raise err_429
+            return {"success": True}
+
+        result = c._api_call_with_retry(fake_func, "arg1", max_retries=3)
+        self.assertEqual(result, {"success": True})
+        self.assertEqual(call_count, 2)
+
+    def test_non_429_error_propagates_immediately(self):
+        import requests as req
+        c = self._ctrl()
+
+        resp_500 = MagicMock(status_code=500, headers={})
+        err_500 = req.exceptions.HTTPError(response=resp_500)
+
+        def fake_func(*args, **kwargs):
+            raise err_500
+
+        with self.assertRaises(req.exceptions.HTTPError):
+            c._api_call_with_retry(fake_func, max_retries=3)
+
+    def test_exhausted_retries_raises(self):
+        import requests as req
+        c = self._ctrl()
+
+        resp_429 = MagicMock(status_code=429, headers={"Retry-After": "0"})
+        err_429 = req.exceptions.HTTPError(response=resp_429)
+
+        def fake_func(*args, **kwargs):
+            raise err_429
+
+        with self.assertRaises(req.exceptions.HTTPError):
+            c._api_call_with_retry(fake_func, max_retries=2)
+
+
+class TestProgressLogging(unittest.TestCase):
+    """Verify progress log messages during page fetching."""
+
+    def _ctrl(self):
+        c = ConfluenceController()
+        c._client = MagicMock()
+        c._url = "https://example.atlassian.net"
+        return c
+
+    def test_parallel_logs_start_and_complete(self):
+        c = self._ctrl()
+        stubs = [_FakePage.stub(str(i)) for i in range(100)]
+        c._client.get_page_by_id.side_effect = lambda pid, **kw: _FakePage.body(pid)
+        c._client.get_page_comments.return_value = _FakePage.comments()
+
+        with self.assertLogs("confluence_scanner.confluence_controller", level="INFO") as cm:
+            list(c._process_pages(stubs, include_comments=False, max_workers=4))
+
+        log_text = "\n".join(cm.output)
+        self.assertIn("Starting parallel page fetch: 100 pages with 4 workers", log_text)
+        self.assertIn("Page fetch complete:", log_text)
+        self.assertIn("100/100", log_text)
+
+    def test_sequential_logs_progress(self):
+        c = self._ctrl()
+        stubs = [_FakePage.stub(str(i)) for i in range(50)]
+        c._client.get_page_by_id.side_effect = lambda pid, **kw: _FakePage.body(pid)
+        c._client.get_page_comments.return_value = _FakePage.comments()
+
+        with self.assertLogs("confluence_scanner.confluence_controller", level="INFO") as cm:
+            list(c._process_pages(stubs, include_comments=False, max_workers=1))
+
+        log_text = "\n".join(cm.output)
+        # Should log final count
+        self.assertIn("50/50", log_text)
 
 
 if __name__ == "__main__":

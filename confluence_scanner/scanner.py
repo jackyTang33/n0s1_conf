@@ -6,7 +6,7 @@ Responsibilities:
   • Scan text blocks for secret matches
   • Orchestrate the two-pass flow (prefetch → approve → scan)
   • Parallel scanning via ProcessPoolExecutor
-  • Report generation (JSON and SARIF-lite)
+  • Report generation (JSON)
 """
 
 import concurrent.futures
@@ -25,6 +25,21 @@ logger = logging.getLogger(__name__)
 # Regex matching (module-level so workers can pickle them)
 # ---------------------------------------------------------------------------
 
+_INLINE_MODIFIERS = ("(?i)", "(?m)", "(?s)", "(?x)", "(?g)", "(?u)", "(?A)", "(?L)", "(?U)")
+
+
+def _normalize_regex(pattern: str) -> str:
+    """Move inline modifiers (e.g. ``(?i)``) to the front of *pattern*.
+
+    Some YAML rules embed modifiers mid-string which can confuse ``re``.  This
+    helper relocates them so the pattern compiles and matches consistently.
+    """
+    for mod in _INLINE_MODIFIERS:
+        if pattern.find(mod) > 0:
+            pattern = mod + pattern.replace(mod, "")
+    return pattern
+
+
 def _safe_re_search(regex_str: str, text: str):
     """Attempt a regex search, falling back to case-insensitive on error."""
     try:
@@ -37,41 +52,43 @@ def _safe_re_search(regex_str: str, text: str):
 
 
 def match_regex(regex_config: dict, text: str):
-    """Try every rule in *regex_config* against *text*.
+    """Yield all matching rules in *regex_config* against *text*.
 
-    Returns (matched_rule, raw_match, sanitized, snippet, line_number) or
-    all-Nones if nothing matched.
+    Yields (matched_rule, raw_match, sanitized, snippet, line_number) for
+    every rule that matches.  Rules whose ``keywords`` list is present but
+    none of the keywords appear in *text* are skipped without running the
+    (more expensive) regex.
     """
+    text_lower = text.lower()
     for rule in regex_config.get("rules", []):
-        regex_str = rule["regex"]
-        # Move inline modifiers to the front (some patterns put them mid-string)
-        for mod in ("(?i)", "(?m)", "(?s)", "(?x)", "(?g)", "(?u)", "(?A)", "(?L)", "(?U)"):
-            if regex_str.find(mod) > 0:
-                regex_str = mod + regex_str.replace(mod, "")
+        keywords = rule.get("keywords")
+        if keywords and not any(kw.lower() in text_lower for kw in keywords):
+            continue
+        regex_str = _normalize_regex(rule["regex"])
         m = _safe_re_search(regex_str, text)
         if m:
             begin, end = m.span()
             matched_text = text[begin:end]
             sanitized, snippet = _sanitize(text, begin, end)
             line_number = text[:begin].count("\n") + 1
-            return rule, matched_text, sanitized, snippet, line_number
-    return None, None, None, None, None
+            yield rule, matched_text, sanitized, snippet, line_number
 
 
 def scan_text(regex_config: dict, text: str):
-    """Return (found: bool, result_dict) for a single text block."""
+    """Return a list of result dicts for all matches in a single text block."""
+    results = []
     try:
-        rule, secret, sanitized, snippet, lineno = match_regex(regex_config, str(text))
-        result = {
-            "matched_regex_config": rule,
-            "secret": secret,
-            "sanitized_secret": sanitized,
-            "snippet_text": snippet,
-            "line_number": lineno,
-        }
-        return (rule is not None), result
+        for rule, secret, sanitized, snippet, lineno in match_regex(regex_config, str(text)):
+            results.append({
+                "matched_regex_config": rule,
+                "secret": secret,
+                "sanitized_secret": sanitized,
+                "snippet_text": snippet,
+                "line_number": lineno,
+            })
     except Exception:
-        return False, {}
+        pass
+    return results
 
 
 def _sanitize(text, begin, end):
@@ -106,8 +123,7 @@ def _worker_scan_chunk(pages: list, regex_config: dict) -> list:
                 texts.extend(t for t in data if t)
 
             for text in texts:
-                found, result = scan_text(regex_config, text)
-                if found:
+                for result in scan_text(regex_config, text):
                     result["ticket_data"] = {**ticket, "field": name, "platform": "Confluence"}
                     result["secret_found"] = True
                     results.append(result)
@@ -139,13 +155,10 @@ class ConfluenceSecretScanner:
         scope: str | None = None,
         skip_comments: bool = False,
         show_secrets: bool = False,
-        post_comment: bool = False,
         timeout: int | None = None,
         limit: int | None = None,
         insecure: bool = False,
         debug: bool = False,
-        secret_manager: str = "a secret manager tool",
-        contact_help: str = "",
     ):
         from .confluence_controller import ConfluenceController
 
@@ -157,13 +170,10 @@ class ConfluenceSecretScanner:
         self.scope = scope
         self.skip_comments = skip_comments
         self.show_secrets = show_secrets
-        self.post_comment = post_comment
         self.timeout = timeout
         self.limit = limit
         self.insecure = insecure
         self.debug = debug
-        self.secret_manager = secret_manager
-        self.contact_help = contact_help
 
         self.regex_config: dict | None = None
         self.regex_stats: dict = {"total": 0, "valid": 0, "skipped": 0, "skip_reasons": [], "tags": {}}
@@ -218,12 +228,7 @@ class ConfluenceSecretScanner:
                 continue
 
             # pre-compile to catch bad patterns early
-            # Apply the same modifier-relocation that match_regex() uses at
-            # scan time so rules with mid-string flags aren't falsely rejected.
-            test_regex = rule["regex"]
-            for mod in ("(?i)", "(?m)", "(?s)", "(?x)", "(?g)", "(?u)", "(?A)", "(?L)", "(?U)"):
-                if test_regex.find(mod) > 0:
-                    test_regex = mod + test_regex.replace(mod, "")
+            test_regex = _normalize_regex(rule["regex"])
             try:
                 re.compile(test_regex)
             except re.error as exc:
@@ -274,10 +279,11 @@ class ConfluenceSecretScanner:
         """Convert a --scope CLI string into a scope_config dict."""
         if not self.scope:
             return
+        scope_stripped = self.scope.lstrip()
         for prefix in ("cql:", "query:", "search:"):
-            if self.scope.lower().replace(" ", "").startswith(prefix):
+            if scope_stripped.lower().startswith(prefix):
                 key = prefix.rstrip(":")
-                self.scope_config = {key: self.scope[len(prefix):]}
+                self.scope_config = {key: scope_stripped[len(prefix):]}
                 return
         # Bare string treated as CQL
         self.scope_config = {"cql": self.scope}
@@ -317,7 +323,7 @@ class ConfluenceSecretScanner:
         # Step 3 — prefetch
         logger.info("Prefetching page data...")
         include_comments = not self.skip_comments
-        pages, stats = self._prefetch(include_comments)
+        pages, stats = self._prefetch(include_comments, num_workers)
 
         if stats["num_pages"] == 0:
             logger.info("No pages found to scan.")
@@ -344,13 +350,14 @@ class ConfluenceSecretScanner:
 
     # ---- pass 1: prefetch --------------------------------------------------
 
-    def _prefetch(self, include_comments):
+    def _prefetch(self, include_comments, max_fetch_workers=1):
         pages = []
         spaces_seen: set[str] = set()
         total_chars = 0
         total_comments = 0
 
-        for ticket in self.controller.get_data(include_comments, self.limit):
+        for ticket in self.controller.get_data(include_comments, self.limit,
+                                               max_fetch_workers=max_fetch_workers):
             pages.append(ticket)
             url = ticket.get("url", "")
             for marker in ("/spaces/", "/display/"):
@@ -467,8 +474,7 @@ class ConfluenceSecretScanner:
             logger.debug("Field [%s]: %d text block(s) to scan", name, len(texts))
 
             for text in texts:
-                found, result = scan_text(self.regex_config, text)
-                if found:
+                for result in scan_text(self.regex_config, text):
                     result["ticket_data"] = {**ticket, "field": name, "platform": "Confluence"}
                     self._record_finding(result)
 
