@@ -1,13 +1,13 @@
 """
 confluence_controller.py — Confluence API client for the standalone scanner.
 
-Handles connection, CQL validation, page/comment fetching, and comment posting.
+Handles connection, CQL validation, and page/comment fetching.
 Self-contained: no base-class inheritance, no platform factory.
 """
 
-import html
 import logging
 import time
+from html.parser import HTMLParser
 
 import requests
 from requests.auth import HTTPBasicAuth
@@ -52,7 +52,6 @@ class ConfluenceController:
         is_connected()          — verify credentials & permissions
         validate_cql(cql)       — cheap fail-fast CQL probe
         get_data(...)           — yield page dicts (title, body, comments, url)
-        post_comment(page_id, comment_html)
     """
 
     def __init__(self):
@@ -190,6 +189,7 @@ class ConfluenceController:
             res = self._client.cql(cql, limit=limit)
             while res:
                 for r in res.get("results", []):
+                    # Can be replaced by adding a "and type=page" to the CQL; currently works as extra safety check
                     ctype = (r.get("content", {}).get("type") or "").lower()
                     if ctype == "page":
                         pages.append(r["content"])
@@ -299,7 +299,7 @@ class ConfluenceController:
                 time.sleep(1)
                 continue
 
-            description = body.get("body", {}).get("storage", {}).get("value", "")
+            description = self._strip_html(body.get("body", {}).get("storage", {}).get("value", ""))
             url = body.get("_links", {}).get("base", "") + p.get("_links", {}).get("webui", "")
 
             comments = []
@@ -325,19 +325,9 @@ class ConfluenceController:
             if not results:
                 break
             for c in results:
-                comments.append(c.get("body", {}).get("storage", {}).get("value", ""))
+                comments.append(self._strip_html(c.get("body", {}).get("storage", {}).get("value", "")))
             start += limit
         return comments
-
-    # ---- comment posting ---------------------------------------------------
-
-    def post_comment(self, page_id: str, comment_html: str) -> bool:
-        if not self._client:
-            return False
-        safe = html.escape(comment_html.replace("#", "0"), quote=True)
-        self._reconnect_if_needed()
-        resp = self._client.add_comment(page_id, safe)
-        return bool(resp and int(resp.get("id", 0)) > 0)
 
     # ---- helpers -----------------------------------------------------------
 
@@ -362,6 +352,32 @@ class ConfluenceController:
         if status == 403:
             raise CQLPermissionError(f"Insufficient permissions for CQL query: {api_msg}") from exc
         raise CQLValidationError(f"CQL query failed (HTTP {status}): {api_msg}") from exc
+
+    @staticmethod
+    def _strip_html(html: str) -> str:
+        """Extract visible text from Confluence storage-format HTML."""
+        if not html:
+            return html
+
+        class _Extractor(HTMLParser):
+            def __init__(self):
+                super().__init__()
+                self._pieces: list[str] = []
+
+            def handle_data(self, data):
+                self._pieces.append(data)
+
+            def handle_entityref(self, name):
+                from html import unescape
+                self._pieces.append(unescape(f"&{name};"))
+
+            def handle_charref(self, name):
+                from html import unescape
+                self._pieces.append(unescape(f"&#{name};"))
+
+        extractor = _Extractor()
+        extractor.feed(html)
+        return " ".join(extractor._pieces)
 
     @staticmethod
     def _pack(title, description, comments, url, page_id):

@@ -141,7 +141,7 @@ class TestWorkerChunk(unittest.TestCase):
     ]
 
     def test_finds_secrets(self):
-        results = _worker_scan_chunk(self.PAGES, self.RULES, label="bot")
+        results = _worker_scan_chunk(self.PAGES, self.RULES)
         self.assertEqual(len(results), 1)
         self.assertTrue(results[0]["secret_found"])
 
@@ -151,7 +151,7 @@ class TestWorkerChunk(unittest.TestCase):
             "description": {"name": "description", "data": "No leaks",  "data_type": "str"},
             "comments":    {"name": "comments",    "data": [],          "data_type": "list"},
         }}]
-        results = _worker_scan_chunk(clean, self.RULES, label="bot")
+        results = _worker_scan_chunk(clean, self.RULES)
         self.assertEqual(len(results), 0)
 
 
@@ -196,6 +196,62 @@ class TestPrefetch(unittest.TestCase):
         self.assertEqual(stats["total_chars"], expected)
 
 
+# ===== HTML stripping =====
+
+class TestStripHtml(unittest.TestCase):
+    def test_strips_tags_keeps_text(self):
+        c = ConfluenceController()
+        html = '<p local-id="c166c5a236d4">Log in: myusername</p><p local-id="22b58b398035">p: testingmaaa</p>'
+        result = c._strip_html(html)
+        self.assertIn("Log in: myusername", result)
+        self.assertIn("p: testingmaaa", result)
+        self.assertNotIn("local-id", result)
+        self.assertNotIn("<p", result)
+
+    def test_strips_confluence_macros(self):
+        c = ConfluenceController()
+        html = '<ac:adf-attribute key="panel-type">note</ac:adf-attribute>'
+        result = c._strip_html(html)
+        self.assertIn("note", result)
+        self.assertNotIn("key=", result)
+        self.assertNotIn("panel-type", result)
+
+    def test_empty_paragraphs_produce_no_noise(self):
+        c = ConfluenceController()
+        html = '<p local-id="abc123" /><p local-id="def456" />'
+        result = c._strip_html(html)
+        self.assertNotIn("abc123", result)
+        self.assertNotIn("def456", result)
+
+    def test_preserves_entities(self):
+        c = ConfluenceController()
+        html = "<p>5 &gt; 3 &amp; 2 &lt; 4</p>"
+        result = c._strip_html(html)
+        self.assertIn(">", result)
+        self.assertIn("&", result)
+        self.assertIn("<", result)
+
+    def test_empty_input(self):
+        c = ConfluenceController()
+        self.assertEqual(c._strip_html(""), "")
+        self.assertEqual(c._strip_html(None), None)
+
+    def test_plain_text_passes_through(self):
+        c = ConfluenceController()
+        self.assertEqual(c._strip_html("just plain text"), "just plain text")
+
+    def test_no_false_positive_on_generic_api_key(self):
+        """The generic-api-key pattern should NOT match stripped Confluence HTML."""
+        import re
+        generic_api_key_regex = r'(?i)(?:key|api|token|secret|client|passwd|password|auth|access)(?:[0-9a-z\-_\t .]{0,20})(?:[\s|\'|\"|\=]){0,3}(?:[\'|\"|\s|\=]){0,3}([0-9a-z\-_.=]{10,150})'
+        c = ConfluenceController()
+        html = '<ac:adf-attribute key="panel-type">note</ac:adf-attribute>'
+        raw_match = re.search(generic_api_key_regex, html)
+        stripped_match = re.search(generic_api_key_regex, c._strip_html(html))
+        self.assertIsNotNone(raw_match, "Sanity: raw HTML should trigger the pattern")
+        self.assertIsNone(stripped_match, "Stripped text should NOT trigger the pattern")
+
+
 # ===== Approval prompt =====
 
 class TestApproval(unittest.TestCase):
@@ -224,6 +280,111 @@ class TestApproval(unittest.TestCase):
     def test_enter_accepts(self, mock_stdin, _):
         mock_stdin.isatty.return_value = True
         self.assertTrue(ConfluenceSecretScanner._prompt_approval(auto_approve=False))
+
+
+# ===== Regex config checker =====
+
+class TestRegexConfigChecker(unittest.TestCase):
+    """Validate _load_regex_config() structure checks, pre-compilation, and stats."""
+
+    def _make_scanner(self, yaml_content: str) -> ConfluenceSecretScanner:
+        """Create a scanner with a temp YAML file containing *yaml_content*."""
+        import tempfile
+        tmp = tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False)
+        tmp.write(yaml_content)
+        tmp.close()
+        self.addCleanup(os.unlink, tmp.name)
+
+        scanner = ConfluenceSecretScanner.__new__(ConfluenceSecretScanner)
+        scanner.regex_file = tmp.name
+        scanner.regex_config = None
+        scanner.regex_stats = {"total": 0, "valid": 0, "skipped": 0, "skip_reasons": [], "tags": {}}
+        scanner.report = {"tool": "confluence_scanner", "findings": {}}
+        scanner._load_regex_config()
+        return scanner
+
+    def test_valid_rules_all_loaded(self):
+        yaml_text = """
+rules:
+  - id: ghp
+    description: GitHub PAT
+    regex: 'ghp_[A-Za-z0-9]{36}'
+    tags: [github]
+  - id: aws
+    description: AWS key
+    regex: 'AKIA[A-Z0-9]{16}'
+    tags: [aws]
+"""
+        s = self._make_scanner(yaml_text)
+        self.assertIsNotNone(s.regex_config)
+        self.assertEqual(len(s.regex_config["rules"]), 2)
+        self.assertEqual(s.regex_stats["total"], 2)
+        self.assertEqual(s.regex_stats["valid"], 2)
+        self.assertEqual(s.regex_stats["skipped"], 0)
+        self.assertEqual(s.regex_stats["tags"], {"github": 1, "aws": 1})
+
+    def test_missing_regex_key_skipped(self):
+        yaml_text = """
+rules:
+  - id: good
+    regex: 'ghp_[A-Za-z0-9]{36}'
+  - id: bad_no_regex
+    description: oops
+"""
+        s = self._make_scanner(yaml_text)
+        self.assertEqual(s.regex_stats["valid"], 1)
+        self.assertEqual(s.regex_stats["skipped"], 1)
+        self.assertIn("missing 'regex' key", s.regex_stats["skip_reasons"][0])
+
+    def test_missing_id_key_skipped(self):
+        yaml_text = """
+rules:
+  - regex: 'ghp_[A-Za-z0-9]{36}'
+    description: no id
+"""
+        s = self._make_scanner(yaml_text)
+        self.assertEqual(s.regex_stats["valid"], 0)
+        self.assertEqual(s.regex_stats["skipped"], 1)
+        self.assertIn("missing 'id' key", s.regex_stats["skip_reasons"][0])
+
+    def test_invalid_regex_skipped(self):
+        yaml_text = """
+rules:
+  - id: good
+    regex: 'ghp_[A-Za-z0-9]{36}'
+  - id: bad_regex
+    regex: '(unclosed_group'
+"""
+        s = self._make_scanner(yaml_text)
+        self.assertEqual(s.regex_stats["valid"], 1)
+        self.assertEqual(s.regex_stats["skipped"], 1)
+        self.assertIn("invalid regex", s.regex_stats["skip_reasons"][0])
+
+    def test_no_rules_key_config_stays_none(self):
+        yaml_text = """
+title: broken config
+"""
+        s = self._make_scanner(yaml_text)
+        self.assertIsNone(s.regex_config)
+        self.assertEqual(s.regex_stats["valid"], 0)
+
+    def test_empty_rules_list(self):
+        yaml_text = """
+rules: []
+"""
+        s = self._make_scanner(yaml_text)
+        self.assertIsNotNone(s.regex_config)
+        self.assertEqual(s.regex_stats["total"], 0)
+        self.assertEqual(s.regex_stats["valid"], 0)
+
+    def test_file_not_found(self):
+        scanner = ConfluenceSecretScanner.__new__(ConfluenceSecretScanner)
+        scanner.regex_file = "/nonexistent/path/nope.yaml"
+        scanner.regex_config = None
+        scanner.regex_stats = {"total": 0, "valid": 0, "skipped": 0, "skip_reasons": [], "tags": {}}
+        scanner.report = {"tool": "confluence_scanner", "findings": {}}
+        scanner._load_regex_config()
+        self.assertIsNone(scanner.regex_config)
 
 
 if __name__ == "__main__":

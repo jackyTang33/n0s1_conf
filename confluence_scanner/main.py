@@ -62,8 +62,6 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Do not scan page comments")
     p.add_argument("--show-secrets", dest="show_secrets", action="store_true",
                    help="Show raw matched secrets in logs (CAUTION: may leak sensitive data)")
-    p.add_argument("--post-comment", dest="post_comment", action="store_true",
-                   help="Post a warning comment on pages with detected secrets")
     p.add_argument("--timeout", type=int, default=None, help="HTTP request timeout in seconds")
     p.add_argument("--limit",   type=int, default=None, help="Max pages per HTTP request")
     p.add_argument("--insecure", action="store_true", help="Disable SSL certificate verification")
@@ -113,7 +111,6 @@ def main():
         scope=args.scope,
         skip_comments=args.skip_comments,
         show_secrets=args.show_secrets,
-        post_comment=args.post_comment,
         timeout=args.timeout,
         limit=args.limit,
         insecure=args.insecure,

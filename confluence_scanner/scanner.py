@@ -90,7 +90,7 @@ def _sha256(value: str) -> str:
 # Top-level worker function (must be at module scope for pickling)
 # ---------------------------------------------------------------------------
 
-def _worker_scan_chunk(pages: list, regex_config: dict, label: str) -> list:
+def _worker_scan_chunk(pages: list, regex_config: dict) -> list:
     """Scan a chunk of pages — called by ProcessPoolExecutor workers."""
     results = []
     for ticket in pages:
@@ -100,10 +100,10 @@ def _worker_scan_chunk(pages: list, regex_config: dict, label: str) -> list:
             dtype = item.get("data_type")
 
             texts = []
-            if dtype == "str" and data and label.lower() not in data.lower():
+            if dtype == "str" and data:
                 texts.append(data)
             elif dtype == "list" and data:
-                texts.extend(t for t in data if t and label.lower() not in t.lower())
+                texts.extend(t for t in data if t)
 
             for text in texts:
                 found, result = scan_text(regex_config, text)
@@ -144,7 +144,6 @@ class ConfluenceSecretScanner:
         limit: int | None = None,
         insecure: bool = False,
         debug: bool = False,
-        label: str = "",
         secret_manager: str = "a secret manager tool",
         contact_help: str = "",
     ):
@@ -163,11 +162,11 @@ class ConfluenceSecretScanner:
         self.limit = limit
         self.insecure = insecure
         self.debug = debug
-        self.label = label
         self.secret_manager = secret_manager
         self.contact_help = contact_help
 
         self.regex_config: dict | None = None
+        self.regex_stats: dict = {"total": 0, "valid": 0, "skipped": 0, "skip_reasons": [], "tags": {}}
         self.scope_config: dict | None = None
         self.report: dict = {"tool": "confluence_scanner", "findings": {}}
         self.controller = ConfluenceController()
@@ -182,8 +181,94 @@ class ConfluenceSecretScanner:
             logger.warning("Regex file [%s] not found!", self.regex_file)
             return
         with open(self.regex_file) as f:
-            self.regex_config = yaml.safe_load(f)
+            raw = yaml.safe_load(f)
+
+        # --- structure validation ---
+        if not isinstance(raw, dict) or "rules" not in raw:
+            logger.error(
+                "Regex config [%s] is missing a 'rules' key or is not a valid mapping. "
+                "Config will NOT be loaded.", self.regex_file,
+            )
+            return
+        if not isinstance(raw["rules"], list):
+            logger.error(
+                "Regex config [%s]: 'rules' must be a list, got %s. "
+                "Config will NOT be loaded.", self.regex_file, type(raw["rules"]).__name__,
+            )
+            return
+
+        # --- per-rule validation & pre-compilation ---
+        valid_rules: list[dict] = []
+        skip_reasons: list[str] = []
+        tag_counts: dict[str, int] = {}
+
+        for idx, rule in enumerate(raw["rules"]):
+            rule_id = rule.get("id", f"<index {idx}>")
+
+            # required keys
+            if "regex" not in rule:
+                reason = f"Rule '{rule_id}': missing 'regex' key — skipped"
+                logger.warning(reason)
+                skip_reasons.append(reason)
+                continue
+            if "id" not in rule:
+                reason = f"Rule at index {idx}: missing 'id' key — skipped"
+                logger.warning(reason)
+                skip_reasons.append(reason)
+                continue
+
+            # pre-compile to catch bad patterns early
+            # Apply the same modifier-relocation that match_regex() uses at
+            # scan time so rules with mid-string flags aren't falsely rejected.
+            test_regex = rule["regex"]
+            for mod in ("(?i)", "(?m)", "(?s)", "(?x)", "(?g)", "(?u)", "(?A)", "(?L)", "(?U)"):
+                if test_regex.find(mod) > 0:
+                    test_regex = mod + test_regex.replace(mod, "")
+            try:
+                re.compile(test_regex)
+            except re.error as exc:
+                reason = f"Rule '{rule_id}': invalid regex ({exc}) — skipped"
+                logger.warning(reason)
+                skip_reasons.append(reason)
+                continue
+
+            valid_rules.append(rule)
+            for tag in rule.get("tags", []):
+                tag_counts[tag] = tag_counts.get(tag, 0) + 1
+
+        # --- store validated config & stats ---
+        raw["rules"] = valid_rules
+        self.regex_config = raw
         self.report["regex_config"] = self.regex_file
+
+        total = len(raw.get("rules", [])) + len(skip_reasons)
+        self.regex_stats = {
+            "total": total,
+            "valid": len(valid_rules),
+            "skipped": len(skip_reasons),
+            "skip_reasons": skip_reasons,
+            "tags": tag_counts,
+        }
+
+        # --- summary log ---
+        lines = [
+            "",
+            "========== Regex Config Summary ==========",
+            f"Config file:      {self.regex_file}",
+            f"Total rules:      {total}",
+            f"Valid rules:      {len(valid_rules)}",
+            f"Skipped rules:    {len(skip_reasons)}",
+        ]
+        if tag_counts:
+            tag_str = ", ".join(f"{t}: {c}" for t, c in sorted(tag_counts.items()))
+            lines.append(f"Tags:             {tag_str}")
+        if skip_reasons:
+            lines.append("Skipped details:")
+            for r in skip_reasons:
+                lines.append(f"  - {r}")
+        lines.append("==========================================")
+        lines.append("")
+        logger.info("\n".join(lines))
 
     def _parse_scope(self):
         """Convert a --scope CLI string into a scope_config dict."""
@@ -246,8 +331,10 @@ class ConfluenceSecretScanner:
         # Step 5 — regex scan
         logger.info("Starting regex scan...")
         if num_workers > 1:
+            logger.info("Parallel scan enabled with %d workers.", num_workers)
             self._scan_parallel(pages, num_workers)
         else:
+            logger.info("Parallel scan disabled. Scanning sequentially...")
             self._scan_sequential(pages)
 
         # Step 6 — summary
@@ -351,7 +438,7 @@ class ConfluenceSecretScanner:
         logger.info("Scanning with %d worker process(es) across %d chunk(s)...", actual, len(chunks))
 
         with concurrent.futures.ProcessPoolExecutor(max_workers=actual) as pool:
-            futures = {pool.submit(_worker_scan_chunk, ch, self.regex_config, self.label): i
+            futures = {pool.submit(_worker_scan_chunk, ch, self.regex_config): i
                        for i, ch in enumerate(chunks)}
             for fut in concurrent.futures.as_completed(futures):
                 idx = futures[fut]
@@ -368,11 +455,16 @@ class ConfluenceSecretScanner:
             data = item.get("data")
             dtype = item.get("data_type")
 
+            logger.debug("Field [%s] dtype=%s data_len=%s", name, dtype,
+                         len(data) if isinstance(data, (str, list)) else data)
+
             texts = []
-            if dtype == "str" and data and self.label.lower() not in data.lower():
+            if dtype == "str" and data:
                 texts.append(data)
             elif dtype == "list" and data:
-                texts.extend(t for t in data if t and self.label.lower() not in t.lower())
+                texts.extend(t for t in data if t)
+
+            logger.debug("Field [%s]: %d text block(s) to scan", name, len(texts))
 
             for text in texts:
                 found, result = scan_text(self.regex_config, text)
@@ -394,13 +486,15 @@ class ConfluenceSecretScanner:
             snippet = result.get("snippet_text", "")
             logger.warning("  Raw snippet: %s", snippet)
 
+        secret_value = result.get("secret", redacted_secret) if self.show_secrets else "not showing secrets"
         fid = _sha256(f"{url}_{redacted_secret}")
         self.report["findings"][fid] = {
             "id": fid,
             "url": url,
-            "secret": redacted_secret,
+            "secret": secret_value,
+            "sanitized_secret": redacted_secret,
             "details": {
-                "matched_regex_config": rule,
+                "matched_regex_config_id": rule.get("id", ""),
                 "platform": "Confluence",
                 "ticket_field": result.get("ticket_data", {}).get("field", ""),
             },

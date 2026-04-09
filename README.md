@@ -40,11 +40,14 @@ Or pass them via CLI flags (see below).
 # Scan everything (with interactive approval prompt):
 python -m confluence_scanner.main
 
-# Scan a specific space with CQL, auto-approve:
-python -m confluence_scanner.main --scope "cql:space=SEC AND type=page" --yes
+# Scan a specific space with CQL:
+python -m confluence_scanner.main --scope 'cql: space=\"~712020123ca5987fcf438384a52d7afe891d2a\" AND type=page' --limit 250
 
 # Use 4 parallel workers:
 python -m confluence_scanner.main --scope "cql:space=DEV" --yes --workers 4
+
+
+python -m confluence_scanner.main --scope "cql: space=\"ACC\" AND ancestor = 93880597 AND type=page" --yes --workers 4 --show-secrets --report-file confluence-secrets-v4.0-lib.json
 
 # Skip comment scanning:
 python -m confluence_scanner.main --skip-comments --yes
@@ -64,7 +67,6 @@ python -m confluence_scanner.main --skip-comments --yes
 | `--workers` | Parallel workers: a number, or `auto` for `min(cpu_count, 8)` | `1` |
 | `--skip-comments` | Don't scan page comments | Off |
 | `--show-secrets` | Show raw matched secrets in logs (CAUTION!) | Off |
-| `--post-comment` | Post warning comments on pages with leaks | Off |
 | `--timeout` | HTTP request timeout (seconds) | None |
 | `--limit` | Max pages per HTTP request | None |
 | `--insecure` | Skip SSL verification | Off |
