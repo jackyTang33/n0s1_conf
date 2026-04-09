@@ -12,19 +12,20 @@ jobs:
     steps:
       - uses: spark1security/n0s1-action@main
         env:
-          JIRA_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
+          CONFLUENCE_TOKEN: ${{ secrets.CONFLUENCE_TOKEN }}
+          CONFLUENCE_EMAIL: ${{ vars.CONFLUENCE_EMAIL }}
+          CONFLUENCE_SERVER: ${{ vars.CONFLUENCE_SERVER }}
         with:
-          scan-target: 'jira_scan'
-          user-email: 'marcelo@spark1.us'
-          platform-url: 'https://spark1us.atlassian.net'
+          scan-target: 'confluence_scan'
           report-format: "sarif"
-          report-file: "jira_secret_report.sarif"
-          timeout: 5
-          limit: 100
+          report-file: "confluence_secret_report.sarif"
+          timeout: 60
+          limit: 250
+          scope: "cql: space=\"ACC\" AND type=page "
       - name: Display SARIF result
         run: |
-          cat jira_secret_report.sarif | jq | head -n 20
-          cat jira_secret_report.sarif | jq | tail -n 20
+          cat confluence_secret_report.sarif | jq | head -n 20
+          cat confluence_secret_report.sarif | jq | tail -n 20
       - uses: github/codeql-action/upload-sarif@v2
         with:
-          sarif_file: "jira_secret_report.sarif"
+          sarif_file: "confluence_secret_report.sarif"
